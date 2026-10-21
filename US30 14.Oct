@@ -1,1 +1,132 @@
+using System;
+using System.Linq;
+using cAlgo.API;
+using cAlgo.API.Internals;
 
+namespace cAlgo.Robotsx
+{
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    public class FVG_Fib_Dynamic_Bot : Robot
+    {
+        // Zustandsvariablen für das laufende Setup
+        private bool _isWaitingForRetracement = false;
+        private int _fvgBarIndex = -1;
+        private double _setupSwingLow = 0;
+        private double _dynamicSwingHigh = 0;
+
+        protected override void OnStart()
+        {
+            Print("🚀 FVG Fib Dynamic Bot gestartet (sucht Swing High dynamisch nach FVG).");
+        }
+
+        protected override void OnBar()
+        {
+            int i = Bars.Count - 1;
+            if (i < 30) return;
+
+            // Keine neuen Orders, wenn bereits eine Position oder Limit Order aktiv ist
+            if (Positions.Any(p => p.Label == "FVG_Fib_Dynamic" && p.SymbolName == SymbolName) ||
+                PendingOrders.Any(o => o.Label == "FVG_Fib_Dynamic" && o.SymbolName == SymbolName))
+            {
+                return;
+            }
+
+            // =========================================================================
+            // SCHRITT 1: FVG ERKENNEN (FALLS KEIN SETUP AKTIV IST)
+            // =========================================================================
+            if (!_isWaitingForRetracement)
+            {
+                double gapBottom = Bars.HighPrices[i - 3];
+                double gapTop = Bars.LowPrices[i - 1];
+
+                // Bullisches FVG gefunden
+                if (gapBottom < gapTop)
+                {
+                    _fvgBarIndex = i - 1; // Die Kerze des FVG
+                    
+                    // Swing Low ist der tiefste Punkt vor/beim FVG
+                    _setupSwingLow = double.MaxValue;
+                    for (int j = Math.Max(0, i - 15); j <= i; j++)
+                    {
+                        if (Bars.LowPrices[j] < _setupSwingLow)
+                            _setupSwingLow = Bars.LowPrices[j];
+                    }
+
+                    // Start-Swing-High initialisieren (aktuelles Hoch)
+                    _dynamicSwingHigh = Bars.HighPrices[i];
+
+                    _isWaitingForRetracement = true;
+                    Print("🔥 FVG erkannt bei Bar {0}! Swing Low fixiert bei {1}. Warte auf Swing High & Retracement...", _fvgBarIndex, _setupSwingLow);
+                    return;
+                }
+            }
+
+            // =========================================================================
+            // SCHRITT 2: DYNAMISCHES SWING HIGH AKTUALISIEREN (NACH DEM FVG)
+            // =========================================================================
+            if (_isWaitingForRetracement)
+            {
+                // Solange der Kurs nach oben weiterläuft, aktualisieren wir das Swing High (höchster Punkt)
+                if (Bars.HighPrices[i - 1] > _dynamicSwingHigh)
+                {
+                    _dynamicSwingHigh = Bars.HighPrices[i - 1];
+                    Print("📈 Neues Swing High gebildet: {0}", _dynamicSwingHigh);
+                }
+
+                // =====================================================================
+                // SCHRITT 3: RETRACEMENT ERKENNEN & LIMIT ORDER PLATZIEREN
+                // =====================================================================
+                // Wenn der Kurs vom Swing High aus wieder nach unten in Richtung FVG/Fibonacci läuft
+                double currentClose = Bars.ClosePrices[i - 1];
+                
+                // Fibonacci 50% Level basierend auf dem aktuellen (evtl. neuem) Swing High berechnen
+                double fib50Price = _setupSwingLow + ((_dynamicSwingHigh - _setupSwingLow) * 0.5);
+
+                // Wenn der Kurs anfängt zurückzusetzen (z.B. unter das Hoch fällt oder sich dem Fib nähert)
+                // Wir prüfen, ob der aktuelle Kurs bereits auf dem Weg nach unten ist:
+                if (currentClose < _dynamicSwingHigh)
+                {
+                    double entryPrice = fib50Price; // Exaktes 50% Fib-Level
+                    double slPrice = _setupSwingLow - (2 * Symbol.PipSize); // SL unter Swing Low
+
+                    if (slPrice >= entryPrice || slPrice <= 0)
+                    {
+                        // Falls ungültig, Setup zurücksetzen
+                        _isWaitingForRetracement = false;
+                        return;
+                    }
+
+                    double slPips = (entryPrice - slPrice) / Symbol.PipSize;
+                    double tpPips = slPips * 2.0; // 1:2 RRR
+
+                    // Risikoberechnung (1%)
+                    double riskAmount = Account.Balance * 0.01;
+                    double riskPerVolumeUnit = slPips * Symbol.PipValue;
+
+                    if (riskPerVolumeUnit > 0)
+                    {
+                        double rawVolume = riskAmount / riskPerVolumeUnit;
+                        double volume = Symbol.NormalizeVolumeInUnits(rawVolume);
+
+                        if (volume >= Symbol.VolumeInUnitsMin)
+                        {
+                            // Buy Limit Order am 50% Fib platzieren
+                            PlaceLimitOrder(TradeType.Buy, SymbolName, volume, entryPrice, "FVG_Fib_Dynamic", slPips, tpPips);
+
+                            // Chart Visualisierung
+                            Chart.DrawHorizontalLine("Fib_0_" + i, _dynamicSwingHigh, Color.Red, 1, LineStyle.Dots);
+                            Chart.DrawHorizontalLine("Fib_50_Entry_" + i, entryPrice, Color.Gold, 2);
+                            Chart.DrawHorizontalLine("Fib_100_" + i, _setupSwingLow, Color.Green, 1, LineStyle.Dots);
+                            Chart.DrawHorizontalLine("SL_" + i, slPrice, Color.DarkRed, 1, LineStyle.Lines);
+
+                            Print("✅ Retracement erkannt! Buy Limit Order am 50% Fib platziert: {0} (Swing High war: {1})", entryPrice, _dynamicSwingHigh);
+
+                            // Setup abschließen / zurücksetzen
+                            _isWaitingForRetracement = false;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
